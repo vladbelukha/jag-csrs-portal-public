@@ -81,6 +81,26 @@ parameters:
   description: sharepoint location
   required: true
   value: sharepoint_blah_blah_location
+
+- name: USE_SHAREPOINT_ONLINE_CONTINGENCY
+  description: When set to 'true', routes document storage to SharePoint Online (OAuth2) instead of on-premises SharePoint (SAML). Set to 'false' or omit to use on-premises behaviour.
+  required: false
+  value: "false"
+
+- name: SPO_TENANT_ID
+  description: Azure AD / Entra ID tenant ID for SharePoint Online authentication (required when UseSharePointOnlineContingency=true)
+  required: false
+  value: ""
+
+- name: SPO_CLIENT_ID
+  description: Application (client) ID registered in Azure AD for SharePoint Online (required when UseSharePointOnlineContingency=true)
+  required: false
+  value: ""
+
+- name: SPO_RESOURCE
+  description: SharePoint Online site root URL, e.g. https://tenant.sharepoint.com/sites/csrs/ (required when UseSharePointOnlineContingency=true)
+  required: false
+  value: ""
 - name: CA_MOUNT_PATH
   description: ca mount path
   required: true
@@ -207,6 +227,32 @@ objects:
                 secretKeyRef:
                   name:  ${FILEMANAGER_CONFIG_NAME}
                   key: RESOURCE
+            - name: UseSharePointOnlineContingency
+              value: ${USE_SHAREPOINT_ONLINE_CONTINGENCY}
+            - name: SPO_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ${FILEMANAGER_CONFIG_NAME}
+                  key: SPO_TENANT_ID
+                  optional: true
+            - name: SPO_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ${FILEMANAGER_CONFIG_NAME}
+                  key: SPO_CLIENT_ID
+                  optional: true
+            - name: SPO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ${FILEMANAGER_CONFIG_NAME}
+                  key: SPO_CLIENT_SECRET
+                  optional: true
+            - name: SPO_RESOURCE
+              valueFrom:
+                secretKeyRef:
+                  name: ${FILEMANAGER_CONFIG_NAME}
+                  key: SPO_RESOURCE
+                  optional: true
             - name: OPENSHIFT
               value: ${OPENSHIFT}
             - name: SSL_CERT_DIR

@@ -59,9 +59,9 @@ namespace Csrs.Services.FileManager
                 Serilog.Debugging.SelfLog.Enable(Console.Error);
             });
 
-            
 
-            builder.Services.AddSharePointIntegration();
+
+            builder.Services.AddSharePointIntegration(builder.Configuration);
 
             builder.Services.AddGrpc(options =>
             {
@@ -104,13 +104,13 @@ namespace Csrs.Services.FileManager
 
         }
     }
-    
+
     internal static class BuildInfo
     {
-    #if GIT_COMMIT
+#if GIT_COMMIT
         public const string GitCommitId = GIT_COMMIT;
-    #else
+#else
         public const string GitCommitId = "unknown";
-    #endif
+#endif
     }
 }

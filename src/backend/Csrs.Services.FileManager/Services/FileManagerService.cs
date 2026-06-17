@@ -13,10 +13,10 @@ namespace Csrs.Services.FileManager
 {
     public class FileManagerService : FileManager.FileManagerBase
     {
-        private readonly SharePointFileManager _sharePointFileManager;
+        private readonly ISharePointFileManager _sharePointFileManager;
         private readonly ILogger<FileManagerService> _logger;
 
-        public FileManagerService(SharePointFileManager sharePointFileManager, ILogger<FileManagerService> logger)
+        public FileManagerService(ISharePointFileManager sharePointFileManager, ILogger<FileManagerService> logger)
         {
             _sharePointFileManager = sharePointFileManager ?? throw new ArgumentNullException(nameof(sharePointFileManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
