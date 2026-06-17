@@ -221,7 +221,7 @@ export class ChildApplicationQuestionComponent implements OnInit {
       secondCtrl: [''],
     });
     this.eFormGroup = this._formBuilder.group({
-      secondCtrl: ['', Validators.required],
+      secondCtrl: [false, Validators.requiredTrue],
     });
     this.nineFormGroup = this._formBuilder.group({
       secondCtrl: ['', Validators.required],
@@ -646,10 +646,7 @@ export class ChildApplicationQuestionComponent implements OnInit {
     let partyRole: PartyRole = PartyRole.Unknown;
     let partyEnrolled = '';
 
-    if (
-      roleData.firstControl ==
-      PartyRole.Recipient
-    ) {
+    if (roleData.firstControl == PartyRole.Recipient) {
       partyRole = PartyRole.Recipient;
       partyEnrolled = 'Recipient';
     } else {
