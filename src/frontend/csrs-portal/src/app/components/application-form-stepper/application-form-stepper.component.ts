@@ -127,7 +127,7 @@ export class ApplicationFormStepperComponent implements OnInit {
     this.sixFormGroup.controls['incomeAssistance'].patchValue('Yes');
 
     this.eFormGroup = this._formBuilder.group({
-      secondCtrl: ['', Validators.required],
+      secondCtrl: [false, Validators.requiredTrue],
     });
     this.nineFormGroup = this._formBuilder.group({});
 
