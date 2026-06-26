@@ -66,8 +66,19 @@ namespace Csrs.Interfaces
                 TenantId = configuration["SPO_TENANT_ID"],
                 ClientId = configuration["SPO_CLIENT_ID"],
                 ClientSecret = configuration["SPO_CLIENT_SECRET"],
-                Resource = new Uri(configuration["SPO_RESOURCE"]),
+                Resource = CreateResourceUri(configuration["SPO_RESOURCE"] ?? configuration["RESOURCE"]),
             };
+        }
+
+        private static Uri CreateResourceUri(string resource)
+        {
+            if (string.IsNullOrWhiteSpace(resource))
+            {
+                throw new InvalidOperationException(
+                    "SPO_RESOURCE must be set to the SharePoint site URL, e.g. https://tenant.sharepoint.com/sites/jsb-fams-dev/");
+            }
+
+            return new Uri(resource.TrimEnd('/') + "/");
         }
     }
 }

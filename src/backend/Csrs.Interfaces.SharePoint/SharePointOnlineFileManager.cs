@@ -31,6 +31,7 @@ namespace Csrs.Interfaces
         private readonly Dictionary<string, string> _driveIdCache = new(StringComparer.OrdinalIgnoreCase);
 
         private string _siteId;
+        private HttpClient _httpClient;
 
         public SharePointOnlineFileManager(
             SharePointOnlineConfiguration configuration,
@@ -52,8 +53,7 @@ namespace Csrs.Interfaces
                 ? $"drives/{driveId}/root/children"
                 : $"drives/{driveId}/{EncodeGraphPath(folderName)}/children";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            using var response = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
@@ -100,8 +100,7 @@ namespace Csrs.Interfaces
             };
 
             string requestPath = $"drives/{driveId}/root/children";
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Post, requestPath, body);
+            using var response = await SendGraphRequestAsync(HttpMethod.Post, requestPath, body);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -123,8 +122,7 @@ namespace Csrs.Interfaces
             };
 
             string requestPath = "lists";
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Post, requestPath, body);
+            using var response = await SendGraphRequestAsync(HttpMethod.Post, requestPath, body);
             string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Post, requestPath, HttpStatusCode.Created);
             var createdList = JObject.Parse(responseContent);
 
@@ -133,7 +131,6 @@ namespace Csrs.Interfaces
                 string listId = createdList["id"]?.ToString();
                 var updateBody = new JObject { ["displayName"] = listTitle };
                 using var updateResponse = await SendGraphRequestAsync(
-                    httpClient,
                     HttpMethod.Patch,
                     $"lists/{listId}",
                     updateBody);
@@ -157,8 +154,7 @@ namespace Csrs.Interfaces
             var driveId = await GetDriveIdAsync(listTitle);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(folderName)}";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Delete, requestPath);
+            using var response = await SendGraphRequestAsync(HttpMethod.Delete, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NoContent)
             {
@@ -185,8 +181,7 @@ namespace Csrs.Interfaces
             var driveId = await GetDriveIdAsync(listTitle);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(folderName)}";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            using var response = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
@@ -275,14 +270,13 @@ namespace Csrs.Interfaces
             string itemPath = BuildItemPath(folderName, fileName);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}/content";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var request = await CreateGraphRequestAsync(httpClient, HttpMethod.Put, requestPath);
-
+            using var request = await CreateSiteGraphRequestAsync(HttpMethod.Put, requestPath);
             var byteArrayContent = new ByteArrayContent(data);
             byteArrayContent.Headers.ContentType = new MediaTypeHeaderValue(
                 string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType);
             request.Content = byteArrayContent;
 
+            var httpClient = await GetHttpClientAsync();
             using var response = await httpClient.SendAsync(request);
             if (response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Created)
             {
@@ -315,8 +309,7 @@ namespace Csrs.Interfaces
             };
 
             string requestPath = $"lists/{listId}/items/{itemId}/fields";
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Patch, requestPath, body);
+            using var response = await SendGraphRequestAsync(HttpMethod.Patch, requestPath, body);
             return await ReadSuccessResponseAsync(response, HttpMethod.Patch, requestPath);
         }
 
@@ -326,8 +319,7 @@ namespace Csrs.Interfaces
             var driveId = await GetDriveIdAsync(libraryName);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}/content";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            using var response = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
             await EnsureSuccessAsync(response, HttpMethod.Get, requestPath);
 
             using var ms = new MemoryStream();
@@ -347,8 +339,7 @@ namespace Csrs.Interfaces
             var driveId = await GetDriveIdAsync(libraryName);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Delete, requestPath);
+            using var response = await SendGraphRequestAsync(HttpMethod.Delete, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NoContent)
             {
@@ -373,14 +364,12 @@ namespace Csrs.Interfaces
             var driveId = await GetDriveIdAsync(oldLibrary);
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(oldItemPath)}";
 
-            using var httpClient = await GetHttpClientAsync();
-            using var getResponse = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            using var getResponse = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
             string itemJson = await ReadSuccessResponseAsync(getResponse, HttpMethod.Get, requestPath);
             string itemId = JObject.Parse(itemJson)["id"]?.ToString();
 
             var body = new JObject { ["name"] = newFileName };
             using var patchResponse = await SendGraphRequestAsync(
-                httpClient,
                 HttpMethod.Patch,
                 $"drives/{driveId}/items/{itemId}",
                 body);
@@ -396,6 +385,11 @@ namespace Csrs.Interfaces
 
         private async Task<HttpClient> GetHttpClientAsync()
         {
+            if (_httpClient != null)
+            {
+                return _httpClient;
+            }
+
 #pragma warning disable CA2000 // Dispose objects before losing scope
             HttpMessageHandler handler = new SocketsHttpHandler
             {
@@ -404,16 +398,13 @@ namespace Csrs.Interfaces
             };
 #pragma warning restore CA2000
 
-            var httpClient = new HttpClient(handler)
-            {
-                BaseAddress = _configuration.GraphBaseUri,
-            };
-            httpClient.DefaultRequestHeaders.Accept.Add(MediaTypeWithQualityHeaderValue.Parse("application/json"));
+            _httpClient = new HttpClient(handler);
+            _httpClient.DefaultRequestHeaders.Accept.Add(MediaTypeWithQualityHeaderValue.Parse("application/json"));
 
             string accessToken = await _authenticator.GetAccessTokenAsync();
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            return httpClient;
+            return _httpClient;
         }
 
         private async Task<string> GetSiteIdAsync()
@@ -430,10 +421,18 @@ namespace Csrs.Interfaces
                 sitePath = "/";
             }
 
-            string requestPath = $"sites/{resourceUri.Host}:{sitePath}";
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
-            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, requestPath);
+            // Site lookup must not go through CreateSiteGraphRequestAsync (which requires a site id).
+            string siteLookupPath = $"sites/{resourceUri.Host}:{sitePath}";
+            var httpClient = await GetHttpClientAsync();
+            using var request = new HttpRequestMessage(HttpMethod.Get, BuildAbsoluteGraphUri(siteLookupPath));
+            using var response = await httpClient.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                await ThrowGraphExceptionAsync(response, HttpMethod.Get, siteLookupPath);
+            }
+
+            string responseContent = await response.Content.ReadAsStringAsync();
             _siteId = JObject.Parse(responseContent)["id"]?.ToString();
 
             if (string.IsNullOrEmpty(_siteId))
@@ -441,28 +440,47 @@ namespace Csrs.Interfaces
                 throw new SharePointRestException("Unable to resolve SharePoint site id from Microsoft Graph.");
             }
 
+            _logger.LogDebug(
+                "Resolved SharePoint site {SiteUrl} to Graph site id {SiteId}",
+                resourceUri,
+                _siteId);
+
             return _siteId;
         }
 
         private async Task<JToken> GetListAsync(string listTitle)
         {
-            string siteId = await GetSiteIdAsync();
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, "lists?$select=id,name,displayName,list");
-            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, "lists");
+            await GetSiteIdAsync();
+            string requestPath = "lists?$select=id,name,displayName,list";
 
-            foreach (var list in ParseGraphCollection(responseContent))
+            do
             {
-                if (list["list"]?["template"]?.ToString() != "documentLibrary")
+                using var response = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
+                string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, requestPath);
+                var responseObject = JObject.Parse(responseContent);
+
+                foreach (var list in ParseGraphCollection(responseContent))
                 {
-                    continue;
+                    if (list["list"]?["template"]?.ToString() != "documentLibrary")
+                    {
+                        continue;
+                    }
+
+                    if (MatchesListTitle(list, listTitle))
+                    {
+                        return list;
+                    }
                 }
 
-                if (MatchesListTitle(list, listTitle))
+                string nextLink = responseObject["@odata.nextLink"]?.ToString();
+                if (string.IsNullOrEmpty(nextLink))
                 {
-                    return list;
+                    break;
                 }
+
+                requestPath = GetGraphPathFromAbsoluteUri(new Uri(nextLink));
             }
+            while (true);
 
             return null;
         }
@@ -481,8 +499,7 @@ namespace Csrs.Interfaces
             }
 
             string listId = list["id"]?.ToString();
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, $"lists/{listId}/drive");
+            using var response = await SendGraphRequestAsync(HttpMethod.Get, $"lists/{listId}/drive");
             string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, $"lists/{listId}/drive");
             string driveId = JObject.Parse(responseContent)["id"]?.ToString();
 
@@ -501,26 +518,43 @@ namespace Csrs.Interfaces
                 || string.Equals(list["displayName"]?.ToString(), listTitle, StringComparison.OrdinalIgnoreCase);
         }
 
-        private async Task<HttpRequestMessage> CreateGraphRequestAsync(HttpClient httpClient, HttpMethod method, string relativePath)
+        private async Task<HttpRequestMessage> CreateSiteGraphRequestAsync(HttpMethod method, string siteRelativePath)
         {
             string siteId = await GetSiteIdAsync();
-            var request = new HttpRequestMessage(method, $"sites/{siteId}/{relativePath}");
-            return request;
+            return new HttpRequestMessage(method, BuildAbsoluteGraphUri($"sites/{siteId}/{siteRelativePath}"));
         }
 
         private async Task<HttpResponseMessage> SendGraphRequestAsync(
-            HttpClient httpClient,
             HttpMethod method,
-            string relativePath,
+            string siteRelativePath,
             JObject body = null)
         {
-            var request = await CreateGraphRequestAsync(httpClient, method, relativePath);
+            var request = await CreateSiteGraphRequestAsync(method, siteRelativePath);
             if (body != null)
             {
                 request.Content = new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json");
             }
 
+            var httpClient = await GetHttpClientAsync();
             return await httpClient.SendAsync(request);
+        }
+
+        private Uri BuildAbsoluteGraphUri(string graphPath)
+        {
+            string baseUrl = _configuration.GraphBaseUri.ToString().TrimEnd('/');
+            return new Uri($"{baseUrl}/{graphPath}");
+        }
+
+        private string GetGraphPathFromAbsoluteUri(Uri absoluteUri)
+        {
+            string baseUrl = _configuration.GraphBaseUri.ToString().TrimEnd('/');
+            string absolutePath = absoluteUri.ToString();
+            if (absolutePath.StartsWith(baseUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                return absolutePath.Substring(baseUrl.Length).TrimStart('/');
+            }
+
+            return absoluteUri.AbsolutePath.TrimStart('/');
         }
 
         private static List<JToken> ParseGraphCollection(string responseContent)
@@ -568,6 +602,13 @@ namespace Csrs.Interfaces
             string responseContent = response.Content == null
                 ? string.Empty
                 : await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            _logger.LogError(
+                "Microsoft Graph request failed. Method={Method} Path={Path} StatusCode={StatusCode} Response={Response}",
+                method,
+                relativePath,
+                response.StatusCode,
+                responseContent);
 
             var ex = new SharePointRestException(
                 $"Microsoft Graph operation returned an invalid status code '{response.StatusCode}'");
