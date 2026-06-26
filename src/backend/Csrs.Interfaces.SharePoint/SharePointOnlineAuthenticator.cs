@@ -36,10 +36,10 @@ namespace Csrs.Interfaces
                 return cachedToken;
             }
 
-            _logger.LogDebug("Requesting new SharePoint Online access token for tenant {TenantId}", _configuration.TenantId);
+            _logger.LogDebug("Requesting new Microsoft Graph access token for tenant {TenantId}", _configuration.TenantId);
 
             string tokenUrl = $"https://login.microsoftonline.com/{_configuration.TenantId}/oauth2/v2.0/token";
-            string scope = $"https://{_configuration.Resource.Host}/.default";
+            const string scope = "https://graph.microsoft.com/.default";
 
             using var client = new HttpClient();
 
@@ -58,15 +58,15 @@ namespace Csrs.Interfaces
 
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("Failed to acquire SharePoint Online access token. StatusCode={StatusCode}", response.StatusCode);
-                throw new SamlAuthenticationException($"SharePoint Online token request failed with status {response.StatusCode}");
+                _logger.LogError("Failed to acquire Microsoft Graph access token. StatusCode={StatusCode}", response.StatusCode);
+                throw new SamlAuthenticationException($"Microsoft Graph token request failed with status {response.StatusCode}");
             }
 
             var tokenResponse = JsonConvert.DeserializeObject<OAuthTokenResponse>(responseJson);
             if (tokenResponse?.AccessToken == null)
             {
-                _logger.LogError("SharePoint Online token response did not contain an access token");
-                throw new SamlAuthenticationException("SharePoint Online token response did not contain an access token");
+                _logger.LogError("Microsoft Graph token response did not contain an access token");
+                throw new SamlAuthenticationException("Microsoft Graph token response did not contain an access token");
             }
 
             int expiresIn = tokenResponse.ExpiresIn > ExpiryBufferSeconds
@@ -76,7 +76,7 @@ namespace Csrs.Interfaces
             var expiry = DateTimeOffset.UtcNow.AddSeconds(expiresIn);
             _cache.Set(CacheKey, tokenResponse.AccessToken, expiry);
 
-            _logger.LogInformation("SharePoint Online access token acquired and cached until {Expiry}", expiry);
+            _logger.LogInformation("Microsoft Graph access token acquired and cached until {Expiry}", expiry);
 
             return tokenResponse.AccessToken;
         }

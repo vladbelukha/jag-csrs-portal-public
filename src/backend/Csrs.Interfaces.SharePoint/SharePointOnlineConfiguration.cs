@@ -20,8 +20,14 @@ namespace Csrs.Interfaces
         public string ClientSecret { get; set; }
 
         /// <summary>
-        /// The SharePoint Online site URL used as the resource base address.
+        /// The SharePoint Online site URL (e.g. https://tenant.sharepoint.com/sites/csrs/).
+        /// Used to resolve the site in Microsoft Graph and to build server-relative URLs.
         /// </summary>
         public Uri Resource { get; set; }
+
+        /// <summary>
+        /// Microsoft Graph API base URL.
+        /// </summary>
+        public Uri GraphBaseUri { get; set; } = new Uri("https://graph.microsoft.com/v1.0/");
     }
 }

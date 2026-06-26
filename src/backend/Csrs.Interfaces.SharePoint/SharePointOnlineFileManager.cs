@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -12,24 +13,24 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using System.Xml;
 
 namespace Csrs.Interfaces
 {
     /// <summary>
     /// SharePoint file manager implementation for SharePoint Online (SPO).
-    /// Uses OAuth2 client credentials (bearer token) for authentication
-    /// rather than the SAML / FedAuth cookie flow used by the on-premises implementation.
+    /// Uses Microsoft Graph API with OAuth2 client credentials (application permissions).
     /// </summary>
     public class SharePointOnlineFileManager : ISharePointFileManager
     {
         private const string DefaultDocumentListTitle = "Account";
-        private const string SharePointSpaceCharacter = "_x0020_";
         private const int MaxUrlLength = 256;
 
         private readonly SharePointOnlineConfiguration _configuration;
         private readonly ISharePointOnlineAuthenticator _authenticator;
         private readonly ILogger<SharePointOnlineFileManager> _logger;
+        private readonly Dictionary<string, string> _driveIdCache = new(StringComparer.OrdinalIgnoreCase);
+
+        private string _siteId;
 
         public SharePointOnlineFileManager(
             SharePointOnlineConfiguration configuration,
@@ -44,102 +45,43 @@ namespace Csrs.Interfaces
         public async Task<List<FileDetailsList>> GetFileDetailsListInFolder(string listTitle, string folderName, string documentType)
         {
             folderName = FixFoldername(folderName);
+            var driveId = await GetDriveIdAsync(listTitle);
+            var fileDetailsList = new List<FileDetailsList>();
 
-            string serverRelativeUrl = Uri.EscapeUriString(listTitle);
-            if (!string.IsNullOrEmpty(folderName))
-            {
-                serverRelativeUrl += "/" + Uri.EscapeUriString(folderName);
-            }
-            serverRelativeUrl = EscapeApostrophe(serverRelativeUrl);
-
-            string responseContent = null;
-            using var request = new HttpRequestMessage
-            {
-                Method = HttpMethod.Get,
-                RequestUri = new Uri(_configuration.Resource, $"_api/web/getFolderByServerRelativeUrl('/{serverRelativeUrl}')/files"),
-                Headers = { { "Accept", "application/json" } }
-            };
+            string requestPath = string.IsNullOrEmpty(folderName)
+                ? $"drives/{driveId}/root/children"
+                : $"drives/{driveId}/{EncodeGraphPath(folderName)}/children";
 
             using var httpClient = await GetHttpClientAsync();
-            HttpResponseMessage response = null;
-            List<FileDetailsList> fileDetailsList = new List<FileDetailsList>();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
 
-            try
+            if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                response = await httpClient.SendAsync(request);
-            }
-            catch (ArgumentNullException)
-            {
-                var ex = new SharePointRestException("The response is null.");
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, null);
-                _logger.LogError("The response is null.");
-                throw ex;
-            }
-            catch (InvalidOperationException)
-            {
-                var ex = new SharePointRestException("The request message was already sent by the HttpClient instance.");
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, null);
-                _logger.LogError("The request message was already sent by the HttpClient instance.");
-                throw ex;
-            }
-            catch (HttpRequestException)
-            {
-                var ex = new SharePointRestException("The request failed due to an underlying issue such as network connectivity, DNS failure, server certificate validation or timeout.");
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, null);
-                _logger.LogError("The request failed due to an underlying issue such as network connectivity, DNS failure, server certificate validation or timeout.");
-                throw ex;
-            }
-            catch (TaskCanceledException)
-            {
-                var ex = new SharePointRestException("The request failed due to timeout.");
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, null);
-                _logger.LogError("The request failed due to timeout.");
-                throw ex;
-            }
-
-            HttpStatusCode statusCode = response.StatusCode;
-
-            if ((int)statusCode == 404)
-            {
-                _logger.LogInformation("The folder '{ServerRelativeUrl}' is not found.", serverRelativeUrl);
+                _logger.LogInformation("The folder '{ListTitle}/{FolderName}' was not found.", listTitle, folderName);
                 return fileDetailsList;
             }
 
-            if ((int)statusCode != 200)
-            {
-                var ex = new SharePointRestException($"Operation returned an invalid status code '{statusCode}'");
-                responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-                throw ex;
-            }
-            else
-            {
-                responseContent = await response.Content.ReadAsStringAsync();
-            }
+            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, requestPath);
+            var children = ParseGraphCollection(responseContent);
 
-            JObject responseObject = null;
-            try
+            foreach (var item in children)
             {
-                responseObject = JObject.Parse(responseContent);
-            }
-            catch (JsonReaderException jre)
-            {
-                _logger.LogError("Error parsing response: {Content}", responseContent);
-                throw jre;
-            }
+                if (item["file"] == null)
+                {
+                    continue;
+                }
 
-            List<JToken> responseResults = responseObject["value"].Children().ToList();
-            foreach (JToken responseResult in responseResults)
-            {
-                FileDetailsList searchResult = responseResult.ToObject<FileDetailsList>();
-                string fileDoctype = Path.GetExtension(searchResult.Name).ToUpper();
-                searchResult.DocumentType = fileDoctype ?? string.Empty;
-                fileDetailsList.Add(searchResult);
+                string name = item["name"]?.ToString();
+                var fileDetails = new FileDetailsList
+                {
+                    Name = name,
+                    Length = item["size"]?.ToString() ?? "0",
+                    TimeCreated = item["createdDateTime"]?.ToString(),
+                    TimeLastModified = item["lastModifiedDateTime"]?.ToString(),
+                    ServerRelativeUrl = BuildServerRelativeUrl(listTitle, folderName, name),
+                    DocumentType = Path.GetExtension(name)?.ToUpper(CultureInfo.InvariantCulture) ?? string.Empty,
+                };
+                fileDetailsList.Add(fileDetails);
             }
 
             return fileDetailsList;
@@ -148,173 +90,112 @@ namespace Csrs.Interfaces
         public async Task CreateFolder(string listTitle, string folderName)
         {
             folderName = FixFoldername(folderName);
-            string relativeUrl = EscapeApostrophe($"/{listTitle}/{folderName}");
+            var driveId = await GetDriveIdAsync(listTitle);
 
-            using var request = new HttpRequestMessage
+            var body = new JObject
             {
-                Method = HttpMethod.Post,
-                RequestUri = new Uri(_configuration.Resource, $"_api/web/folders/add('{relativeUrl}')"),
-                Headers = { { "Accept", "application/json" } }
+                ["name"] = folderName,
+                ["folder"] = new JObject(),
+                ["@microsoft.graph.conflictBehavior"] = "fail",
             };
 
-            StringContent strContent = new StringContent("", Encoding.UTF8);
-            strContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json;odata=verbose");
-            request.Content = strContent;
-
+            string requestPath = $"drives/{driveId}/root/children";
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Post, requestPath, body);
 
             if (!response.IsSuccessStatusCode)
             {
-                var ex = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-                string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-                throw ex;
+                await ThrowGraphExceptionAsync(response, HttpMethod.Post, requestPath);
             }
         }
 
         public async Task<object> CreateDocumentLibrary(string listTitle, string documentTemplateUrlTitle = null)
         {
-            using var listsRequest = new HttpRequestMessage(HttpMethod.Post, new Uri(_configuration.Resource, "_api/web/Lists"));
-
             if (string.IsNullOrEmpty(documentTemplateUrlTitle))
             {
                 documentTemplateUrlTitle = listTitle;
             }
 
-            var library = CreateNewDocumentLibraryRequest(documentTemplateUrlTitle);
-            string jsonString = JsonConvert.SerializeObject(library);
-            StringContent strContent = new StringContent(jsonString, Encoding.UTF8);
-            strContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json;odata=verbose");
-            listsRequest.Content = strContent;
-            listsRequest.Headers.Add("odata-version", "3.0");
+            var body = new JObject
+            {
+                ["displayName"] = documentTemplateUrlTitle,
+                ["list"] = new JObject { ["template"] = "documentLibrary" },
+            };
 
+            string requestPath = "lists";
             using var httpClient = await GetHttpClientAsync();
-            using var listsResponse = await httpClient.SendAsync(listsRequest);
-            HttpStatusCode statusCode = listsResponse.StatusCode;
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Post, requestPath, body);
+            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Post, requestPath, HttpStatusCode.Created);
+            var createdList = JObject.Parse(responseContent);
 
-            if (statusCode != HttpStatusCode.Created || !listsResponse.IsSuccessStatusCode)
+            if (!string.Equals(listTitle, documentTemplateUrlTitle, StringComparison.OrdinalIgnoreCase))
             {
-                var ex = new SharePointRestException($"Operation returned an invalid status code '{statusCode}'");
-                string responseContent = await listsResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
-                ex.Request = new HttpRequestMessageWrapper(listsRequest, null);
-                ex.Response = new HttpResponseMessageWrapper(listsResponse, responseContent);
-                throw ex;
-            }
-            else
-            {
-                jsonString = await listsResponse.Content.ReadAsStringAsync();
-                var ob = JsonConvert.DeserializeObject<DocumentLibraryResponse>(jsonString);
-
-                if (listTitle != documentTemplateUrlTitle)
-                {
-                    using var titleRequest = new HttpRequestMessage(HttpMethod.Post, new Uri(_configuration.Resource, $"_api/web/lists(guid'{ob.d.Id}')"));
-                    var updateRequest = new
-                    {
-                        __metadata = new { type = "SP.List" },
-                        Title = listTitle
-                    };
-                    jsonString = JsonConvert.SerializeObject(updateRequest);
-                    strContent = new StringContent(jsonString, Encoding.UTF8);
-                    strContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json;odata=verbose");
-                    titleRequest.Headers.Add("IF-MATCH", "*");
-                    titleRequest.Headers.Add("X-HTTP-Method", "MERGE");
-                    titleRequest.Content = strContent;
-
-                    using var titleResponse = await httpClient.SendAsync(titleRequest);
-                    titleResponse.EnsureSuccessStatusCode();
-                }
+                string listId = createdList["id"]?.ToString();
+                var updateBody = new JObject { ["displayName"] = listTitle };
+                using var updateResponse = await SendGraphRequestAsync(
+                    httpClient,
+                    HttpMethod.Patch,
+                    $"lists/{listId}",
+                    updateBody);
+                await ReadSuccessResponseAsync(updateResponse, HttpMethod.Patch, $"lists/{listId}");
             }
 
-            return library;
+            _driveIdCache.Remove(listTitle);
+            _driveIdCache.Remove(documentTemplateUrlTitle);
+
+            return body;
         }
 
         public async Task<object> UpdateDocumentLibrary(string listTitle)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Put, new Uri(_configuration.Resource, "_api/web/Lists"));
-
-            var library = CreateNewDocumentLibraryRequest(listTitle);
-            string jsonString = JsonConvert.SerializeObject(library);
-            StringContent strContent = new StringContent(jsonString, Encoding.UTF8);
-            strContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json;odata=verbose");
-            request.Content = strContent;
-
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
-            HttpStatusCode statusCode = response.StatusCode;
-
-            if (statusCode != HttpStatusCode.Created || !response.IsSuccessStatusCode)
-            {
-                var ex = new SharePointRestException($"Operation returned an invalid status code '{statusCode}'");
-                string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                ex.Request = new HttpRequestMessageWrapper(request, null);
-                ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-                throw ex;
-            }
-
-            return library;
+            return await CreateDocumentLibrary(listTitle);
         }
 
         public async Task<bool> DeleteFolder(string listTitle, string folderName)
         {
             folderName = FixFoldername(folderName);
-            string serverRelativeUrl = $"{listTitle}/{folderName}";
-
-            using var request = new HttpRequestMessage
-            {
-                Method = HttpMethod.Delete,
-                RequestUri = new Uri(_configuration.Resource, "_api/web/getFolderByServerRelativeUrl('/" + EscapeApostrophe(serverRelativeUrl) + "')"),
-                Headers = { { "Accept", "application/json" } }
-            };
-            request.Headers.Add("IF-MATCH", "*");
-            request.Headers.Add("X-HTTP-Method", "DELETE");
+            var driveId = await GetDriveIdAsync(listTitle);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(folderName)}";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Delete, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NoContent)
             {
                 return true;
             }
 
-            var ex2 = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-            string content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            ex2.Request = new HttpRequestMessageWrapper(request, null);
-            ex2.Response = new HttpResponseMessageWrapper(response, content);
-            throw ex2;
+            await ThrowGraphExceptionAsync(response, HttpMethod.Delete, requestPath);
+            return false;
         }
 
         public async Task<bool> FolderExists(string listTitle, string folderName)
         {
-            var folder = await GetFolder(listTitle, folderName);
-            return folder != null;
+            return await GetFolder(listTitle, folderName) != null;
         }
 
         public async Task<bool> DocumentLibraryExists(string listTitle)
         {
-            var library = await GetDocumentLibrary(listTitle);
-            return library != null;
+            return await GetDocumentLibrary(listTitle) != null;
         }
 
         public async Task<object> GetFolder(string listTitle, string folderName)
         {
             folderName = FixFoldername(folderName);
-            string serverRelativeUrl = $"{listTitle}/{folderName}";
-
-            using var endpointRequest = new HttpRequestMessage
-            {
-                Method = HttpMethod.Get,
-                RequestUri = new Uri(_configuration.Resource, "_api/web/getFolderByServerRelativeUrl('/" + EscapeApostrophe(serverRelativeUrl) + "')"),
-                Headers = { { "Accept", "application/json" } }
-            };
+            var driveId = await GetDriveIdAsync(listTitle);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(folderName)}";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(endpointRequest);
-            string jsonString = await response.Content.ReadAsStringAsync();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
 
-            if (response.StatusCode == HttpStatusCode.OK || response.IsSuccessStatusCode)
+            if (response.StatusCode == HttpStatusCode.NotFound)
             {
+                return null;
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                string jsonString = await response.Content.ReadAsStringAsync();
                 return JsonConvert.DeserializeObject(jsonString);
             }
 
@@ -323,25 +204,8 @@ namespace Csrs.Interfaces
 
         public async Task<object> GetDocumentLibrary(string listTitle)
         {
-            string title = Uri.EscapeUriString(listTitle);
-
-            using var request = new HttpRequestMessage
-            {
-                Method = HttpMethod.Get,
-                RequestUri = new Uri(_configuration.Resource, $"_api/web/lists/GetByTitle('{title}')"),
-                Headers = { { "Accept", "application/json" } }
-            };
-
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
-            string jsonString = await response.Content.ReadAsStringAsync();
-
-            if (response.StatusCode == HttpStatusCode.OK)
-            {
-                return JsonConvert.DeserializeObject(jsonString);
-            }
-
-            return null;
+            var list = await GetListAsync(listTitle);
+            return list == null ? null : list.ToObject<object>();
         }
 
         public async Task<string> AddFile(string folderName, string fileName, Stream fileData, string contentType)
@@ -352,11 +216,11 @@ namespace Csrs.Interfaces
         public async Task<string> AddFile(string documentLibrary, string folderName, string fileName, Stream fileData, string contentType)
         {
             folderName = FixFoldername(folderName);
-            bool folderExists = await FolderExists(documentLibrary, folderName);
-            if (!folderExists)
+            if (!await FolderExists(documentLibrary, folderName))
             {
                 await CreateFolder(documentLibrary, folderName);
             }
+
             return await UploadFile(fileName, documentLibrary, folderName, fileData, contentType);
         }
 
@@ -368,11 +232,11 @@ namespace Csrs.Interfaces
         public async Task<string> AddFile(string documentLibrary, string folderName, string fileName, byte[] fileData, string contentType)
         {
             folderName = FixFoldername(folderName);
-            bool folderExists = await FolderExists(documentLibrary, folderName);
-            if (!folderExists)
+            if (!await FolderExists(documentLibrary, folderName))
             {
                 await CreateFolder(documentLibrary, folderName);
             }
+
             return await UploadFile(fileName, documentLibrary, folderName, fileData, contentType);
         }
 
@@ -380,8 +244,7 @@ namespace Csrs.Interfaces
         {
             using var ms = new MemoryStream();
             fileData.CopyTo(ms);
-            byte[] data = ms.ToArray();
-            return await UploadFile(fileName, listTitle, folderName, data, contentType);
+            return await UploadFile(fileName, listTitle, folderName, ms.ToArray(), contentType);
         }
 
         public string GetTruncatedFileName(string fileName, string listTitle, string folderName)
@@ -390,12 +253,12 @@ namespace Csrs.Interfaces
             fileName = FixFilename(fileName, maxLength);
             folderName = FixFoldername(folderName);
 
-            string serverRelativeUrl = GetServerRelativeURL(listTitle, folderName);
-            string requestUriString = GenerateUploadRequestUriString(serverRelativeUrl, fileName);
+            string itemPath = BuildItemPath(folderName, fileName);
+            string requestPath = $"drives/{{driveId}}/{EncodeGraphPath(itemPath)}/content";
 
-            if (requestUriString.Length > MaxUrlLength)
+            if (requestPath.Length > MaxUrlLength)
             {
-                int delta = requestUriString.Length - MaxUrlLength;
+                int delta = requestPath.Length - MaxUrlLength;
                 maxLength -= delta;
                 fileName = FixFilename(fileName, maxLength);
             }
@@ -408,80 +271,64 @@ namespace Csrs.Interfaces
             folderName = FixFoldername(folderName);
             fileName = GetTruncatedFileName(fileName, listTitle, folderName);
 
-            string serverRelativeUrl = GetServerRelativeURL(listTitle, folderName);
-            string requestUriString = GenerateUploadRequestUriString(serverRelativeUrl, fileName);
-
-            using var request = new HttpRequestMessage
-            {
-                Method = HttpMethod.Post,
-                RequestUri = new Uri(requestUriString),
-                Headers = { { "Accept", "application/json" } }
-            };
-
-            ByteArrayContent byteArrayContent = new ByteArrayContent(data);
-            byteArrayContent.Headers.Add("content-length", data.Length.ToString());
-            request.Content = byteArrayContent;
+            var driveId = await GetDriveIdAsync(listTitle);
+            string itemPath = BuildItemPath(folderName, fileName);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}/content";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
+            using var request = await CreateGraphRequestAsync(httpClient, HttpMethod.Put, requestPath);
 
-            if (response.StatusCode == HttpStatusCode.OK)
+            var byteArrayContent = new ByteArrayContent(data);
+            byteArrayContent.Headers.ContentType = new MediaTypeHeaderValue(
+                string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType);
+            request.Content = byteArrayContent;
+
+            using var response = await httpClient.SendAsync(request);
+            if (response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Created)
             {
                 return fileName;
             }
 
-            var ex = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-            string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            ex.Request = new HttpRequestMessageWrapper(request, null);
-            ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-            throw ex;
+            await ThrowGraphExceptionAsync(response, HttpMethod.Put, requestPath);
+            return fileName;
         }
 
         public async Task<string> UpdateListItemFields(AddFileResponse itemData, string listTitle, string contentType, string fileName)
         {
-            string requestUriString = GenerateUpdateListItemUriString(listTitle, itemData.ListItemAllFields.ID.ToString());
-
-            using var request = new HttpRequestMessage(HttpMethod.Post, requestUriString);
-
-            var listItem = CreateUpdateListItemRequestRequest(contentType, fileName, listTitle);
-            string jsonString = JsonConvert.SerializeObject(listItem);
-            StringContent strContent = new StringContent(jsonString, Encoding.UTF8);
-            strContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json;odata=verbose");
-
-            request.Headers.Add("Accept", "application/json;odata=verbose");
-            request.Headers.Add("X-Http-Method", "MERGE");
-            request.Headers.Add("IF-MATCH", "*");
-            request.Headers.Add("odata-version", "3.0");
-            request.Content = strContent;
-
-            using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
-            string streamData = await response.Content.ReadAsStringAsync();
-
-            if (response.StatusCode == HttpStatusCode.OK || response.StatusCode == HttpStatusCode.NoContent)
+            var list = await GetListAsync(listTitle);
+            if (list == null)
             {
-                return streamData;
+                throw new SharePointRestException($"Document library '{listTitle}' was not found.");
             }
 
-            var ex = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-            string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            ex.Request = new HttpRequestMessageWrapper(request, null);
-            ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-            throw ex;
+            string listId = list["id"]?.ToString();
+            string itemId = itemData?.ListItemAllFields?.ID.ToString(CultureInfo.InvariantCulture);
+            if (string.IsNullOrEmpty(itemId))
+            {
+                throw new SharePointRestException("List item id was not provided.");
+            }
+
+            var body = new JObject
+            {
+                ["Title"] = contentType,
+                ["FileLeafRef"] = fileName,
+            };
+
+            string requestPath = $"lists/{listId}/items/{itemId}/fields";
+            using var httpClient = await GetHttpClientAsync();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Patch, requestPath, body);
+            return await ReadSuccessResponseAsync(response, HttpMethod.Patch, requestPath);
         }
 
         public async Task<byte[]> DownloadFile(string url)
         {
-            url = EscapeApostrophe(url);
-
-            using var endpointRequest = new HttpRequestMessage
-            {
-                Method = HttpMethod.Get,
-                RequestUri = new Uri(_configuration.Resource, $"_api/web/GetFileByServerRelativeUrl('{url}')/$value"),
-            };
+            var (libraryName, itemPath) = ParseServerRelativeUrl(url);
+            var driveId = await GetDriveIdAsync(libraryName);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}/content";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(endpointRequest);
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            await EnsureSuccessAsync(response, HttpMethod.Get, requestPath);
 
             using var ms = new MemoryStream();
             await response.Content.CopyToAsync(ms);
@@ -491,59 +338,60 @@ namespace Csrs.Interfaces
         public async Task<bool> DeleteFile(string listTitle, string folderName, string fileName)
         {
             folderName = FixFoldername(folderName);
-            string serverRelativeUrl = $"/{listTitle}/{folderName}/{fileName}";
-            return await DeleteFile(serverRelativeUrl);
+            return await DeleteFile(BuildServerRelativeUrl(listTitle, folderName, fileName));
         }
 
         public async Task<bool> DeleteFile(string serverRelativeUrl)
         {
-            serverRelativeUrl = EscapeApostrophe(serverRelativeUrl);
-
-            using var request = new HttpRequestMessage
-            {
-                Method = HttpMethod.Delete,
-                RequestUri = new Uri(_configuration.Resource, $"_api/web/GetFileByServerRelativeUrl('/{serverRelativeUrl}')"),
-                Headers = { { "Accept", "application/json" } }
-            };
-            request.Headers.Add("IF-MATCH", "*");
-            request.Headers.Add("X-HTTP-Method", "DELETE");
+            var (libraryName, itemPath) = ParseServerRelativeUrl(serverRelativeUrl);
+            var driveId = await GetDriveIdAsync(libraryName);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Delete, requestPath);
 
             if (response.StatusCode == HttpStatusCode.NoContent)
             {
                 return true;
             }
 
-            var ex = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-            string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            ex.Request = new HttpRequestMessageWrapper(request, null);
-            ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-            throw ex;
+            await ThrowGraphExceptionAsync(response, HttpMethod.Delete, requestPath);
+            return false;
         }
 
         public async Task<bool> RenameFile(string oldServerRelativeUrl, string newServerRelativeUrl)
         {
-            oldServerRelativeUrl = EscapeApostrophe(oldServerRelativeUrl);
-            newServerRelativeUrl = EscapeApostrophe(newServerRelativeUrl);
+            var (oldLibrary, oldItemPath) = ParseServerRelativeUrl(oldServerRelativeUrl);
+            var (newLibrary, newItemPath) = ParseServerRelativeUrl(newServerRelativeUrl);
 
-            Uri url = new Uri(_configuration.Resource, $"_api/web/GetFileByServerRelativeUrl('{oldServerRelativeUrl}')/moveto(newurl='{newServerRelativeUrl}', flags=1)");
-            using var request = new HttpRequestMessage(HttpMethod.Post, url);
+            if (!string.Equals(oldLibrary, newLibrary, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new SharePointRestException("Renaming files across document libraries is not supported.");
+            }
+
+            string newFileName = Path.GetFileName(newItemPath.Replace('/', Path.DirectorySeparatorChar));
+            var driveId = await GetDriveIdAsync(oldLibrary);
+            string requestPath = $"drives/{driveId}/{EncodeGraphPath(oldItemPath)}";
 
             using var httpClient = await GetHttpClientAsync();
-            using var response = await httpClient.SendAsync(request);
+            using var getResponse = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            string itemJson = await ReadSuccessResponseAsync(getResponse, HttpMethod.Get, requestPath);
+            string itemId = JObject.Parse(itemJson)["id"]?.ToString();
 
-            if (response.StatusCode == HttpStatusCode.OK)
+            var body = new JObject { ["name"] = newFileName };
+            using var patchResponse = await SendGraphRequestAsync(
+                httpClient,
+                HttpMethod.Patch,
+                $"drives/{driveId}/items/{itemId}",
+                body);
+
+            if (patchResponse.IsSuccessStatusCode)
             {
                 return true;
             }
 
-            var ex = new SharePointRestException($"Operation returned an invalid status code '{response.StatusCode}'");
-            string responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            ex.Request = new HttpRequestMessageWrapper(request, null);
-            ex.Response = new HttpResponseMessageWrapper(response, responseContent);
-            throw ex;
+            await ThrowGraphExceptionAsync(patchResponse, HttpMethod.Patch, $"drives/{driveId}/items/{itemId}");
+            return false;
         }
 
         private async Task<HttpClient> GetHttpClientAsync()
@@ -552,79 +400,252 @@ namespace Csrs.Interfaces
             HttpMessageHandler handler = new SocketsHttpHandler
             {
                 AllowAutoRedirect = false,
-                MaxConnectionsPerServer = 25
+                MaxConnectionsPerServer = 25,
             };
 #pragma warning restore CA2000
 
-            HttpClient httpClient = new HttpClient(handler);
-            httpClient.BaseAddress = _configuration.Resource;
-            httpClient.DefaultRequestHeaders.Accept.Add(MediaTypeWithQualityHeaderValue.Parse("application/json;odata=verbose"));
+            var httpClient = new HttpClient(handler)
+            {
+                BaseAddress = _configuration.GraphBaseUri,
+            };
+            httpClient.DefaultRequestHeaders.Accept.Add(MediaTypeWithQualityHeaderValue.Parse("application/json"));
 
             string accessToken = await _authenticator.GetAccessTokenAsync();
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            string digest = await GetDigest(httpClient);
-            if (digest is not null)
-            {
-                httpClient.DefaultRequestHeaders.Add("X-RequestDigest", digest);
-            }
-
-            httpClient.DefaultRequestHeaders.Add("Cache-Control", "no-cache");
-            httpClient.DefaultRequestHeaders.Add("OData-Version", "4.0");
-
             return httpClient;
         }
 
-        private async Task<string> GetDigest(HttpClient client)
+        private async Task<string> GetSiteIdAsync()
         {
-            string result = null;
-
-            using var endpointRequest = new HttpRequestMessage
+            if (!string.IsNullOrEmpty(_siteId))
             {
-                Method = HttpMethod.Post,
-                RequestUri = new Uri(_configuration.Resource, "_api/contextinfo"),
-                Headers = { { "Accept", "application/json;odata=verbose" } }
-            };
-
-            var response = await client.SendAsync(endpointRequest);
-            string jsonString = await response.Content.ReadAsStringAsync();
-
-            if (response.StatusCode == HttpStatusCode.OK && jsonString.Length > 1)
-            {
-                if (jsonString[0] == '{')
-                {
-                    JToken t = JToken.Parse(jsonString);
-                    result = t["d"]["GetContextWebInformation"]["FormDigestValue"].ToString();
-                }
-                else
-                {
-                    XmlDocument doc = new XmlDocument();
-                    doc.LoadXml(jsonString);
-                    var digests = doc.GetElementsByTagName("d:FormDigestValue");
-                    if (digests.Count > 0)
-                    {
-                        result = digests[0].InnerText;
-                    }
-                }
+                return _siteId;
             }
 
-            return result;
+            var resourceUri = _configuration.Resource;
+            string sitePath = resourceUri.AbsolutePath.TrimEnd('/');
+            if (string.IsNullOrEmpty(sitePath))
+            {
+                sitePath = "/";
+            }
+
+            string requestPath = $"sites/{resourceUri.Host}:{sitePath}";
+            using var httpClient = await GetHttpClientAsync();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, requestPath);
+            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, requestPath);
+            _siteId = JObject.Parse(responseContent)["id"]?.ToString();
+
+            if (string.IsNullOrEmpty(_siteId))
+            {
+                throw new SharePointRestException("Unable to resolve SharePoint site id from Microsoft Graph.");
+            }
+
+            return _siteId;
         }
 
-        private static string EscapeApostrophe(string value)
+        private async Task<JToken> GetListAsync(string listTitle)
         {
-            if (!string.IsNullOrEmpty(value))
+            string siteId = await GetSiteIdAsync();
+            using var httpClient = await GetHttpClientAsync();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, "lists?$select=id,name,displayName,list");
+            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, "lists");
+
+            foreach (var list in ParseGraphCollection(responseContent))
             {
-                return value.Replace("'", "''");
+                if (list["list"]?["template"]?.ToString() != "documentLibrary")
+                {
+                    continue;
+                }
+
+                if (MatchesListTitle(list, listTitle))
+                {
+                    return list;
+                }
             }
-            return value;
+
+            return null;
+        }
+
+        private async Task<string> GetDriveIdAsync(string listTitle)
+        {
+            if (_driveIdCache.TryGetValue(listTitle, out string cachedDriveId))
+            {
+                return cachedDriveId;
+            }
+
+            var list = await GetListAsync(listTitle);
+            if (list == null)
+            {
+                throw new SharePointRestException($"Document library '{listTitle}' was not found.");
+            }
+
+            string listId = list["id"]?.ToString();
+            using var httpClient = await GetHttpClientAsync();
+            using var response = await SendGraphRequestAsync(httpClient, HttpMethod.Get, $"lists/{listId}/drive");
+            string responseContent = await ReadSuccessResponseAsync(response, HttpMethod.Get, $"lists/{listId}/drive");
+            string driveId = JObject.Parse(responseContent)["id"]?.ToString();
+
+            if (string.IsNullOrEmpty(driveId))
+            {
+                throw new SharePointRestException($"Unable to resolve drive id for document library '{listTitle}'.");
+            }
+
+            _driveIdCache[listTitle] = driveId;
+            return driveId;
+        }
+
+        private static bool MatchesListTitle(JToken list, string listTitle)
+        {
+            return string.Equals(list["name"]?.ToString(), listTitle, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(list["displayName"]?.ToString(), listTitle, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<HttpRequestMessage> CreateGraphRequestAsync(HttpClient httpClient, HttpMethod method, string relativePath)
+        {
+            string siteId = await GetSiteIdAsync();
+            var request = new HttpRequestMessage(method, $"sites/{siteId}/{relativePath}");
+            return request;
+        }
+
+        private async Task<HttpResponseMessage> SendGraphRequestAsync(
+            HttpClient httpClient,
+            HttpMethod method,
+            string relativePath,
+            JObject body = null)
+        {
+            var request = await CreateGraphRequestAsync(httpClient, method, relativePath);
+            if (body != null)
+            {
+                request.Content = new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json");
+            }
+
+            return await httpClient.SendAsync(request);
+        }
+
+        private static List<JToken> ParseGraphCollection(string responseContent)
+        {
+            var responseObject = JObject.Parse(responseContent);
+            if (responseObject["value"] is JArray values)
+            {
+                return values.Children().ToList();
+            }
+
+            return new List<JToken>();
+        }
+
+        private async Task<string> ReadSuccessResponseAsync(
+            HttpResponseMessage response,
+            HttpMethod method,
+            string relativePath,
+            HttpStatusCode? expectedStatusCode = null)
+        {
+            await EnsureSuccessAsync(response, method, relativePath, expectedStatusCode);
+            return response.Content == null ? string.Empty : await response.Content.ReadAsStringAsync();
+        }
+
+        private async Task EnsureSuccessAsync(
+            HttpResponseMessage response,
+            HttpMethod method,
+            string relativePath,
+            HttpStatusCode? expectedStatusCode = null)
+        {
+            if (expectedStatusCode.HasValue && response.StatusCode == expectedStatusCode.Value)
+            {
+                return;
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                return;
+            }
+
+            await ThrowGraphExceptionAsync(response, method, relativePath);
+        }
+
+        private async Task ThrowGraphExceptionAsync(HttpResponseMessage response, HttpMethod method, string relativePath)
+        {
+            string responseContent = response.Content == null
+                ? string.Empty
+                : await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            var ex = new SharePointRestException(
+                $"Microsoft Graph operation returned an invalid status code '{response.StatusCode}'");
+            ex.Request = new HttpRequestMessageWrapper(new HttpRequestMessage(method, relativePath), null);
+            ex.Response = new HttpResponseMessageWrapper(response, responseContent);
+            throw ex;
+        }
+
+        private string GetSiteServerRelativePath()
+        {
+            return _configuration.Resource.AbsolutePath.TrimEnd('/');
+        }
+
+        private string BuildServerRelativeUrl(string listTitle, string folderName, string fileName)
+        {
+            string path = $"{GetSiteServerRelativePath()}/{listTitle}";
+            if (!string.IsNullOrEmpty(folderName))
+            {
+                path += $"/{folderName}";
+            }
+
+            if (!string.IsNullOrEmpty(fileName))
+            {
+                path += $"/{fileName}";
+            }
+
+            return path;
+        }
+
+        private (string LibraryName, string ItemPath) ParseServerRelativeUrl(string serverRelativeUrl)
+        {
+            string normalizedUrl = serverRelativeUrl.Trim().TrimStart('/');
+            string sitePath = GetSiteServerRelativePath().TrimStart('/');
+
+            if (normalizedUrl.StartsWith(sitePath, StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedUrl = normalizedUrl.Substring(sitePath.Length).TrimStart('/');
+            }
+
+            int separatorIndex = normalizedUrl.IndexOf('/');
+            if (separatorIndex < 0)
+            {
+                return (normalizedUrl, string.Empty);
+            }
+
+            string libraryName = normalizedUrl.Substring(0, separatorIndex);
+            string itemPath = normalizedUrl.Substring(separatorIndex + 1);
+            return (libraryName, itemPath);
+        }
+
+        private static string BuildItemPath(string folderName, string fileName)
+        {
+            if (string.IsNullOrEmpty(folderName))
+            {
+                return fileName;
+            }
+
+            return $"{folderName}/{fileName}";
+        }
+
+        private static string EncodeGraphPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return "root";
+            }
+
+            var encodedSegments = path
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Select(Uri.EscapeDataString);
+            return $"root:/{string.Join("/", encodedSegments)}:";
         }
 
         private string GetInvalidCharacters(string osInvalidChars)
         {
             osInvalidChars += "~#%&*()[]{}:;+@^<>|.?!/";
             string invalidChars = Regex.Escape(osInvalidChars);
-            return string.Format(@"([{0}]*\.+$)|([{0}]+)", invalidChars);
+            return string.Format(CultureInfo.InvariantCulture, @"([{0}]*\.+$)|([{0}]+)", invalidChars);
         }
 
         private string RemoveInvalidCharacters(string filename)
@@ -648,51 +669,8 @@ namespace Csrs.Interfaces
                 result = Path.GetFileNameWithoutExtension(result).Substring(0, maxLength - extension.Length);
                 result += extension;
             }
+
             return result;
-        }
-
-        private string GetServerRelativeURL(string listTitle, string folderName)
-        {
-            folderName = FixFoldername(folderName);
-            return Uri.EscapeUriString(listTitle) + "/" + Uri.EscapeUriString(folderName);
-        }
-
-        private string GenerateUploadRequestUriString(string folderServerRelativeUrl, string fileName)
-        {
-            folderServerRelativeUrl = EscapeApostrophe(folderServerRelativeUrl);
-            fileName = EscapeApostrophe(fileName);
-            Uri requestUri = new Uri(_configuration.Resource, $"_api/web/getFolderByServerRelativeUrl('/{folderServerRelativeUrl}')/Files/add(url='{fileName}',overwrite=true)?$expand=ListItemAllFields");
-            return requestUri.ToString();
-        }
-
-        private string GenerateUpdateListItemUriString(string listTitle, string id)
-        {
-            listTitle = EscapeApostrophe(listTitle);
-            id = EscapeApostrophe(id);
-            Uri requestUri = new Uri(_configuration.Resource, $"_api/web/lists/getbytitle('{listTitle}')/items({id})");
-            return requestUri.ToString();
-        }
-
-        private static object CreateNewDocumentLibraryRequest(string listName)
-        {
-            return new
-            {
-                __metadata = new { type = "SP.List" },
-                BaseTemplate = 101,
-                Title = listName
-            };
-        }
-
-        private static object CreateUpdateListItemRequestRequest(string title, string fileName, string listTitle)
-        {
-            string formattedTitle = listTitle.Replace(" ", SharePointSpaceCharacter);
-            string itemType = $"SP.Data.{formattedTitle}Item";
-            return new
-            {
-                __metadata = new { type = itemType },
-                FileLeafRef = fileName,
-                Title = title
-            };
         }
     }
 }

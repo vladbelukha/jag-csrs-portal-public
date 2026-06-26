@@ -9,13 +9,13 @@ namespace Csrs.Interfaces
         /// <summary>
         /// Adds the required services to use SharePoint file management.
         /// When <c>UseSharePointOnlineContingency</c> is set to <c>true</c> in configuration,
-        /// registers <see cref="SharePointOnlineFileManager"/> (OAuth2 bearer token, SharePoint Online).
+        /// registers <see cref="SharePointOnlineFileManager"/> (Microsoft Graph API, SharePoint Online).
         /// Otherwise registers <see cref="SharePointFileManager"/> (SAML / FedAuth, on-premises).
         /// </summary>
         public static void AddSharePointIntegration(this IServiceCollection services, IConfiguration configuration)
         {
             bool useSpo = string.Equals(
-                configuration["USE_SHAREPOINT_ONLINE_CONTINGENCY"],
+                configuration["USE_SHAREPOINT_ONLINE_CONTINGENCY"] ?? configuration["UseSharePointOnlineContingency"],
                 "true",
                 StringComparison.OrdinalIgnoreCase);
 
