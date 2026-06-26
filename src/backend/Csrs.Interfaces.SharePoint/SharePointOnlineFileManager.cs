@@ -320,11 +320,25 @@ namespace Csrs.Interfaces
             string requestPath = $"drives/{driveId}/{EncodeGraphPath(itemPath)}/content";
 
             using var response = await SendGraphRequestAsync(HttpMethod.Get, requestPath);
-            await EnsureSuccessAsync(response, HttpMethod.Get, requestPath);
 
-            using var ms = new MemoryStream();
-            await response.Content.CopyToAsync(ms);
-            return ms.ToArray();
+            if (IsRedirectStatusCode(response.StatusCode))
+            {
+                Uri redirectUri = response.Headers.Location;
+                if (redirectUri == null)
+                {
+                    await ThrowGraphExceptionAsync(response, HttpMethod.Get, requestPath);
+                }
+
+                if (!redirectUri.IsAbsoluteUri && response.RequestMessage?.RequestUri != null)
+                {
+                    redirectUri = new Uri(response.RequestMessage.RequestUri, redirectUri);
+                }
+
+                return await DownloadFromRedirectUrlAsync(redirectUri);
+            }
+
+            await EnsureSuccessAsync(response, HttpMethod.Get, requestPath);
+            return await ReadResponseBytesAsync(response);
         }
 
         public async Task<bool> DeleteFile(string listTitle, string folderName, string fileName)
@@ -537,6 +551,32 @@ namespace Csrs.Interfaces
 
             var httpClient = await GetHttpClientAsync();
             return await httpClient.SendAsync(request);
+        }
+
+        private static bool IsRedirectStatusCode(HttpStatusCode statusCode)
+        {
+            return statusCode is HttpStatusCode.Redirect
+                or HttpStatusCode.MovedPermanently
+                or HttpStatusCode.SeeOther
+                or HttpStatusCode.TemporaryRedirect
+                or HttpStatusCode.PermanentRedirect;
+        }
+
+        private static async Task<byte[]> DownloadFromRedirectUrlAsync(Uri redirectUri)
+        {
+            // Graph returns a pre-authenticated download URL; do not send the Graph bearer token.
+            using var handler = new SocketsHttpHandler { AllowAutoRedirect = true };
+            using var client = new HttpClient(handler);
+            using var response = await client.GetAsync(redirectUri);
+            response.EnsureSuccessStatusCode();
+            return await ReadResponseBytesAsync(response);
+        }
+
+        private static async Task<byte[]> ReadResponseBytesAsync(HttpResponseMessage response)
+        {
+            using var ms = new MemoryStream();
+            await response.Content.CopyToAsync(ms);
+            return ms.ToArray();
         }
 
         private Uri BuildAbsoluteGraphUri(string graphPath)
