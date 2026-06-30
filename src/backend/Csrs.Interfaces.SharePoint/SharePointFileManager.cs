@@ -20,7 +20,7 @@ using System.Xml;
 namespace Csrs.Interfaces
 {
 
-    public class SharePointFileManager
+    public class SharePointFileManager : ISharePointFileManager
     {
         public const string DefaultDocumentUrlTitle = "account";
         public const string ApplicationDocumentListTitle = "Application";
@@ -104,7 +104,7 @@ namespace Csrs.Interfaces
             {
                 response = await httpClient.SendAsync(request);
             }
-            catch(ArgumentNullException e)
+            catch (ArgumentNullException e)
             {
                 var ex = new SharePointRestException("The response is null.");
                 ex.Request = new HttpRequestMessageWrapper(request, null);
@@ -112,7 +112,7 @@ namespace Csrs.Interfaces
                 _logger.LogError("The response is null.");
                 throw ex;
             }
-            catch(InvalidOperationException e)
+            catch (InvalidOperationException e)
             {
                 var ex = new SharePointRestException("The request message was already sent by the HttpClient instance.");
                 ex.Request = new HttpRequestMessageWrapper(request, null);

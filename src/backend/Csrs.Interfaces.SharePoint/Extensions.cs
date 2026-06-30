@@ -7,19 +7,34 @@ namespace Csrs.Interfaces
     public static class Extensions
     {
         /// <summary>
-        /// Adds the requires services to be able to use SharePointFileManager.
+        /// Adds the required services to use SharePoint file management.
+        /// When <c>UseSharePointOnlineContingency</c> is set to <c>true</c> in configuration,
+        /// registers <see cref="SharePointOnlineFileManager"/> (Microsoft Graph API, SharePoint Online).
+        /// Otherwise registers <see cref="SharePointFileManager"/> (SAML / FedAuth, on-premises).
         /// </summary>
-        /// <param name="services"></param>
-        public static void AddSharePointIntegration(this IServiceCollection services)
+        public static void AddSharePointIntegration(this IServiceCollection services, IConfiguration configuration)
         {
-            services.AddSingleton(GetSharePointFileManagerConfiguration);
-            services.AddScoped<SharePointFileManager>();
+            bool useSpo = string.Equals(
+                configuration["USE_SHAREPOINT_ONLINE_CONTINGENCY"] ?? configuration["UseSharePointOnlineContingency"],
+                "true",
+                StringComparison.OrdinalIgnoreCase);
 
-            // SAML services
-            // token caches are singleton because they maintain a per instance prefix
-            // that can be changed to effectively clear the cache
-            services.AddSingleton<ITokenCache<SamlTokenParameters, string>, SamlTokenTokenCache>();
-            services.AddTransient<ISamlAuthenticator, SamlAuthenticator>();
+            if (useSpo)
+            {
+                services.AddSingleton(GetSharePointOnlineConfiguration);
+                services.AddSingleton<ISharePointOnlineAuthenticator, SharePointOnlineAuthenticator>();
+                services.AddScoped<ISharePointFileManager, SharePointOnlineFileManager>();
+            }
+            else
+            {
+                services.AddSingleton(GetSharePointFileManagerConfiguration);
+                // SAML services
+                // token caches are singleton because they maintain a per instance prefix
+                // that can be changed to effectively clear the cache
+                services.AddSingleton<ITokenCache<SamlTokenParameters, string>, SamlTokenTokenCache>();
+                services.AddTransient<ISamlAuthenticator, SamlAuthenticator>();
+                services.AddScoped<ISharePointFileManager, SharePointFileManager>();
+            }
 
             services.AddMemoryCache();
         }
@@ -41,5 +56,30 @@ namespace Csrs.Interfaces
 
             return sharePointFileManagerConfiguration;
         }
+
+        private static SharePointOnlineConfiguration GetSharePointOnlineConfiguration(IServiceProvider serviceProvider)
+        {
+            IConfiguration configuration = serviceProvider.GetService<IConfiguration>();
+
+            return new SharePointOnlineConfiguration
+            {
+                TenantId = configuration["SPO_TENANT_ID"],
+                ClientId = configuration["SPO_CLIENT_ID"],
+                ClientSecret = configuration["SPO_CLIENT_SECRET"],
+                Resource = CreateResourceUri(configuration["SPO_RESOURCE"] ?? configuration["RESOURCE"]),
+            };
+        }
+
+        private static Uri CreateResourceUri(string resource)
+        {
+            if (string.IsNullOrWhiteSpace(resource))
+            {
+                throw new InvalidOperationException(
+                    "SPO_RESOURCE must be set to the SharePoint site URL, e.g. https://tenant.sharepoint.com/sites/jsb-fams-dev/");
+            }
+
+            return new Uri(resource.TrimEnd('/') + "/");
+        }
     }
 }
+

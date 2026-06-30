@@ -96,7 +96,7 @@ public static class WebApplicationBuilderExtensions
     private static void ConfigureFileManagerService(WebApplicationBuilder builder, FileManagerConfiguration? configuration)
     {
         var logger = Log.ForContext(typeof(WebApplicationBuilderExtensions));
-        
+
         if (string.IsNullOrWhiteSpace(configuration?.Address))
         {
             const string message = $"FileManager configuration is not set, {nameof(CsrsConfiguration.FileManager)}:{nameof(FileManagerConfiguration.Address)} is required.";
@@ -112,6 +112,8 @@ public static class WebApplicationBuilderExtensions
         if (configuration.Secure.HasValue && !configuration.Secure.Value)
         {
             logger.Information("Configuration explicitly set Secure=false. Using insecure channel for File Manager service.");
+            // Required for Grpc.Net.Client to use h2c (unencrypted HTTP/2) on .NET 6
+            AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
             credentials = ChannelCredentials.Insecure;
         }
         else
